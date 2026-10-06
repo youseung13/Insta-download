@@ -1,1 +1,16 @@
+{
+  "name": "공개 게시물 다운로드",
+  "short_name": "다운로드",
+  "description": "공개 인스타그램/유튜브 게시물을 다운로드하는 도구",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
 
