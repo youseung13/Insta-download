@@ -36,6 +36,7 @@
     - 다른 사람의 콘텐츠를 재배포하는 용도로 쓰지 마세요.
 """
 import hashlib
+import html
 import os
 import re
 import shutil
@@ -68,21 +69,51 @@ app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(
 
 
 def _prepare_cookie_file():
-    """IG_COOKIES_TXT 환경변수(Netscape 형식 cookies.txt 전체 내용)가 있으면
-    임시 파일로 저장해서 그 경로를 돌려준다. 없거나 쓰기 실패하면 None."""
-    raw = os.environ.get("IG_COOKIES_TXT", "").strip()
-    if not raw:
+    """IG_COOKIES_TXT(인스타그램), YT_COOKIES_TXT(유튜브) 환경변수에 들어있는
+    Netscape 형식 cookies.txt 내용을 하나의 임시 파일로 합쳐서 그 경로를 돌려준다.
+    둘 다 없거나 쓰기 실패하면 None."""
+    lines = []
+    for var in ("IG_COOKIES_TXT", "YT_COOKIES_TXT"):
+        raw = os.environ.get(var, "").strip()
+        for line in raw.splitlines():
+            line = line.strip()
+            # 각 파일의 "# Netscape HTTP Cookie File" 같은 주석 줄은 빼고 합친다.
+            # (#HttpOnly_ 로 시작하는 줄은 주석이 아니라 실제 쿠키라서 남긴다)
+            if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+                continue
+            lines.append(line)
+    if not lines:
         return None
     try:
-        fd, path = tempfile.mkstemp(prefix="ig_cookies_", suffix=".txt")
+        fd, path = tempfile.mkstemp(prefix="cookies_", suffix=".txt")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            if not raw.startswith("#"):
-                # Netscape 쿠키 파일 헤더가 없으면 yt-dlp가 형식을 못 알아볼 수 있어 보정
-                f.write("# Netscape HTTP Cookie File\n")
-            f.write(raw + "\n")
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("\n".join(lines) + "\n")
         return path
     except Exception:
         return None
+
+
+def _friendly_error(msg: str) -> str:
+    """yt-dlp 에러 메시지에 상황별 한국어 설명을 붙인다."""
+    low = msg.lower()
+    if "not a bot" in low or "sign in to confirm" in low:
+        return msg + (
+            "\n\n(유튜브가 이 서버(클라우드 IP)를 봇으로 의심해서 막은 것입니다. "
+            "영상이 비공개라서가 아닙니다. Render 환경변수 YT_COOKIES_TXT에 "
+            "유튜브 로그인 쿠키를 넣으면 대부분 해결됩니다. README 참고)"
+        )
+    if "429" in msg:
+        return msg + (
+            "\n\n(사이트가 이 서버의 요청을 일시적으로 막은 것일 수 있습니다. "
+            "잠시 후 다시 시도해 주세요.)"
+        )
+    if any(k in low for k in ("login", "private", "authentication")):
+        return msg + (
+            "\n\n(비공개 계정/스토리이거나 로그인이 필요한 콘텐츠일 수 있습니다. "
+            "이 도구는 공개 게시물만 지원합니다.)"
+        )
+    return msg
 
 
 # 서버 프로세스(워커)당 한 번만 파일로 써둔다.
@@ -150,8 +181,9 @@ INDEX_HTML = """
 <title>공개 게시물 다운로드</title>{style}{pwa}</head><body>
 <h1>공개 게시물 다운로드</h1>
 <form method=post action="/download" id=f>
-<input type=text name=url id=urlInput placeholder="인스타그램/유튜브 등 공개 게시물 URL" autofocus>
+<input type=text name=url id=urlInput placeholder="인스타그램/유튜브 등 공개 게시물 URL" value="{prefill}" autofocus>
 
+<button type=button id=pasteBtn class=secondary>붙여넣기</button>
 <button type=button id=previewBtn class=secondary>미리보기</button>
 <div id=previewArea>
   <img id=previewImg style="display:none">
@@ -167,6 +199,30 @@ INDEX_HTML = """
 <button type=submit id=btn>다운로드</button>
 </form>
 <script>
+// 붙여넣기 버튼: 클립보드의 링크를 입력칸에 넣고 바로 미리보기
+document.getElementById('pasteBtn').addEventListener('click', async function(){{
+  try {{
+    var t = await navigator.clipboard.readText();
+    var m = (t || '').match(/https?:\\/\\/\\S+/);
+    document.getElementById('urlInput').value = m ? m[0] : (t || '').trim();
+    document.getElementById('previewBtn').click();
+  }} catch (e) {{
+    var err = document.getElementById('previewError');
+    err.textContent = '클립보드를 읽지 못했어요. 입력칸을 길게 눌러 직접 붙여넣어 주세요.';
+    err.style.display = 'block';
+  }}
+}});
+
+// 입력칸에 직접 붙여넣어도 자동으로 미리보기
+document.getElementById('urlInput').addEventListener('paste', function(){{
+  setTimeout(function(){{ document.getElementById('previewBtn').click(); }}, 50);
+}});
+
+// 인스타 앱 등에서 "공유"로 들어온 경우 자동 미리보기
+if ({autopreview} && document.getElementById('urlInput').value) {{
+  window.addEventListener('load', function(){{ document.getElementById('previewBtn').click(); }});
+}}
+
 document.getElementById('f').addEventListener('submit', function(){{
   var b = document.getElementById('btn');
   b.disabled = true;
@@ -235,11 +291,47 @@ def check_auth():
     return session.get("authed") is True
 
 
+def render_index(error: str = "", prefill: str = "", autopreview: bool = False) -> str:
+    return INDEX_HTML.format(
+        style=PAGE_STYLE,
+        pwa=PWA_HEAD,
+        error=error,
+        prefill=html.escape(prefill or "", quote=True),
+        autopreview="true" if autopreview else "false",
+    )
+
+
+def _extract_url(*texts) -> str:
+    """공유로 넘어온 title/text/url 중에서 첫 번째 http(s) 링크를 찾는다."""
+    for t in texts:
+        if not t:
+            continue
+        m = re.search(r"https?://\S+", t)
+        if m:
+            return m.group(0)
+    return ""
+
+
 @app.route("/", methods=["GET"])
 def index():
     if not check_auth():
         return redirect(url_for("login"))
-    return INDEX_HTML.format(style=PAGE_STYLE, pwa=PWA_HEAD, error="")
+    # 로그인 전에 "공유"로 들어왔던 링크가 있으면 이어서 채워준다
+    pending = session.pop("pending_url", "")
+    return render_index(prefill=pending, autopreview=bool(pending))
+
+
+@app.route("/share", methods=["GET"])
+def share():
+    # 홈 화면에 설치된 상태에서 인스타그램/유튜브 앱의 "공유" → 이 사이트를 고르면 여기로 들어온다
+    url = _extract_url(
+        request.args.get("url"), request.args.get("text"), request.args.get("title")
+    )
+    if not check_auth():
+        if url:
+            session["pending_url"] = url
+        return redirect(url_for("login"))
+    return render_index(prefill=url, autopreview=bool(url))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -301,12 +393,7 @@ def preview():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        msg = str(e)
-        if "429" in msg:
-            msg = "요청이 너무 많아 일시적으로 막혔습니다. 잠시 후 다시 시도해 주세요."
-        elif any(k in msg.lower() for k in ("login", "private", "authentication")):
-            msg = "비공개 계정/스토리이거나 로그인이 필요한 콘텐츠일 수 있습니다."
-        return jsonify({"error": msg}), 400
+        return jsonify({"error": _friendly_error(str(e))}), 400
 
     if not info:
         return jsonify({"error": "정보를 가져오지 못했습니다."}), 400
@@ -334,9 +421,7 @@ def download():
     url = (request.form.get("url") or "").strip()
     fmt = (request.form.get("fmt") or "video").strip()
     if not url.startswith(("http://", "https://")):
-        return INDEX_HTML.format(
-            style=PAGE_STYLE, pwa=PWA_HEAD, error="<div class=error>올바른 URL을 입력해 주세요.</div>"
-        )
+        return render_index(error="<div class=error>올바른 URL을 입력해 주세요.</div>", prefill=url)
 
     work_dir = tempfile.mkdtemp(prefix="dl_")
     outtmpl = os.path.join(work_dir, "%(playlist_index|)s%(playlist_index& - |)s%(title).150s.%(ext)s")
@@ -390,19 +475,9 @@ def download():
 
     if last_error is not None:
         shutil.rmtree(work_dir, ignore_errors=True)
-        msg = str(last_error)
-        if "429" in msg:
-            msg += (
-                "\n\n(인스타그램이 이 서버의 요청을 일시적으로 막은 것일 수 있습니다. "
-                "잠시 후 다시 시도해 주세요.)"
-            )
-        elif any(k in msg.lower() for k in ("login", "private", "authentication")):
-            msg += (
-                "\n\n(비공개 계정/스토리이거나 로그인이 필요한 콘텐츠일 수 있습니다. "
-                "이 도구는 공개 게시물만 지원합니다.)"
-            )
-        return INDEX_HTML.format(
-            style=PAGE_STYLE, pwa=PWA_HEAD, error=f"<div class=error>다운로드 실패:\n{msg}</div>"
+        msg = _friendly_error(str(last_error))
+        return render_index(
+            error=f"<div class=error>다운로드 실패:\n{html.escape(msg)}</div>", prefill=url
         )
 
     # 임시 작업 폴더에 남은, yt-dlp의 부가 파일(.part/.json 등)을 제외한
@@ -415,10 +490,9 @@ def download():
     ]
     if not files:
         shutil.rmtree(work_dir, ignore_errors=True)
-        return INDEX_HTML.format(
-            style=PAGE_STYLE,
-            pwa=PWA_HEAD,
+        return render_index(
             error="<div class=error>파일을 받지 못했습니다. 지원되지 않는 게시물 형식일 수 있습니다.</div>",
+            prefill=url,
         )
 
     if len(files) > 1:
